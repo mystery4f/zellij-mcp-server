@@ -2,13 +2,14 @@ import { execAsync } from '../utils/command.js';
 import { Validator } from '../utils/validator.js';
 import { cache } from '../utils/cache.js';
 import { ToolResponse, ValidationError } from '../types/zellij.js';
-import { writeFileSync, readFileSync, existsSync, unlinkSync, watchFile, unwatchFile } from 'fs';
+import { writeFileSync, readFileSync, existsSync, unlinkSync, watch } from 'fs';
+import { dirname, basename } from 'path';
 import { spawn, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 
 export class DetectionTools {
-  private static watchers = new Map<string, any>();
+  private static watchers = new Map<string, import('fs').FSWatcher>();
   private static processes = new Map<string, ChildProcess>();
 
   /**
@@ -52,14 +53,15 @@ export class DetectionTools {
         });
       }, timeoutMs);
 
+      let activeStream: import('fs').ReadStream | null = null;
       let buffer = '';
       let found = false;
 
       const cleanup = () => {
         clearTimeout(timeout);
-        if (this.watchers.has(pipePath)) {
-          unwatchFile(pipePath);
-          this.watchers.delete(pipePath);
+        if (activeStream) {
+          activeStream.destroy();
+          activeStream = null;
         }
       };
 
@@ -71,9 +73,9 @@ export class DetectionTools {
           return;
         }
 
-        const stream = createReadStream(pipePath);
+        activeStream = createReadStream(pipePath);
         
-        stream.on('data', (chunk: string | Buffer) => {
+        activeStream.on('data', (chunk: string | Buffer) => {
           buffer += chunk.toString();
           
           // Check for patterns
@@ -94,7 +96,7 @@ export class DetectionTools {
           }
         });
 
-        stream.on('end', () => {
+        activeStream.on('end', () => {
           cleanup();
           resolve({
             content: [{
@@ -106,7 +108,7 @@ export class DetectionTools {
           });
         });
 
-        stream.on('error', (error) => {
+        activeStream.on('error', (error) => {
           cleanup();
           reject(new ValidationError(`Error reading pipe: ${error.message}`));
         });
@@ -327,7 +329,7 @@ export class DetectionTools {
       const cleanup = () => {
         clearTimeout(timeout);
         if (this.watchers.has(filePath)) {
-          unwatchFile(filePath);
+          this.watchers.get(filePath)!.close();
           this.watchers.delete(filePath);
         }
       };
@@ -370,14 +372,28 @@ export class DetectionTools {
       // Check immediately
       checkFile();
 
-      // Watch for file changes
-      watchFile(filePath, (curr, prev) => {
-        if (curr.mtime > prev.mtime) {
-          checkFile();
-        }
-      });
+      // Use fs.watch on parent directory for instant OS-level events
+      // (inotify/ReadDirectoryChangesW) instead of stat-polling watchFile
+      // This catches file creation even when the file doesn't exist yet
+      const dir = dirname(filePath);
+      const fileBasename = basename(filePath);
+      let watcher: import('fs').FSWatcher;
 
-      this.watchers.set(filePath, true);
+      try {
+        watcher = watch(dir, (eventType, filename) => {
+          if (filename === fileBasename) {
+            checkFile();
+          }
+        });
+        watcher.on('error', () => {
+          // Directory might not exist yet; fall back gracefully
+        });
+      } catch {
+        // watch() may fail if dir doesn't exist; resolve on timeout only
+        watcher = { close: () => {} } as unknown as import('fs').FSWatcher;
+      }
+
+      this.watchers.set(filePath, watcher);
     });
   }
 
@@ -509,8 +525,8 @@ The wrapper provides:
     let cleaned = 0;
     
     // Stop all watchers
-    for (const [path] of this.watchers) {
-      unwatchFile(path);
+    for (const [path, watcher] of this.watchers) {
+      watcher.close();
       cleaned++;
     }
     this.watchers.clear();

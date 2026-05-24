@@ -373,15 +373,24 @@ export class PaneTools {
       throw new ValidationError(`Invalid command: ${cmdValidation.errors.join(', ')}`);
     }
 
-    const result = await execAsync(`zellij action write-chars "${cmdValidation.sanitized}"`);
-    
-    // Also send Enter to execute
-    await execAsync('zellij action write-chars "\\n"');
+    const sanitized = cmdValidation.sanitized!;
+
+    // Handle multi-line commands: split by \n and execute each line with Enter
+    const lines = sanitized.split(/\\n|\n/).filter((line: string) => line.trim().length > 0);
+
+    for (const line of lines) {
+      const escapedLine = line.replace(/"/g, '\\"');
+      await execAsync(`zellij action write-chars "${escapedLine}"`);
+      // Use send-keys Enter instead of write-chars "\n" (fixes Windows issue where \n is literal)
+      await execAsync('zellij action send-keys Enter');
+      // Small delay between lines to let the terminal process
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
 
     return {
       content: [{
         type: 'text',
-        text: `Command executed in pane: ${cmdValidation.sanitized}${result.stdout ? `\nOutput: ${result.stdout}` : ''}`
+        text: `Command executed in pane: ${sanitized}`
       }]
     };
   }
@@ -399,8 +408,8 @@ export class PaneTools {
     const result = await execAsync(`zellij action write-chars "${textValidation.sanitized}"`);
 
     if (submit) {
-      // Send Enter to submit
-      await execAsync('zellij action write-chars "\\n"');
+      // Use send-keys Enter instead of write-chars "\n" (fixes Windows issue where \n is literal)
+      await execAsync('zellij action send-keys Enter');
     }
 
     return {
